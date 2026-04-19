@@ -1,0 +1,8 @@
+test/
+train/
+valid/
+__pycache__/
+*.txt
+*.json
+*.png
+*.jpg
