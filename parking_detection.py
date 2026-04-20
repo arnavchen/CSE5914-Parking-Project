@@ -1,16 +1,16 @@
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
+from skimage import io, util
 
 
 class Config:
     BLUR_SIGMA = 1.0
-    DIFF_THRESHOLD = 30
-    OCCUPANCY_THRESHOLD = 0.15
+    DIFF_THRESHOLD = 45
+    OCCUPANCY_THRESHOLD = 0.60
 
     MORPH_KERNEL_SIZE = 3
-    MORPH_ITERATIONS = 1
+    MORPH_ITERATIONS = 2
 
     EMPTY_COLOR = (0, 255, 0)
     OCCUPIED_COLOR = (255, 0, 0)
@@ -21,7 +21,7 @@ def load_rgb_uint8(image_path: str) -> np.ndarray:
     if not Path(image_path).exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    img = mpimg.imread(image_path)
+    img = io.imread(image_path)
 
     if img.ndim == 2:
         img = np.stack([img, img, img], axis=-1)
@@ -29,12 +29,7 @@ def load_rgb_uint8(image_path: str) -> np.ndarray:
     if img.shape[-1] == 4:
         img = img[..., :3]
 
-    if np.issubdtype(img.dtype, np.floating):
-        img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-    else:
-        img = img.astype(np.uint8)
-
-    return img
+    return util.img_as_ubyte(img).astype(np.uint8)
 
 
 def to_gray(image: np.ndarray) -> np.ndarray:
@@ -115,13 +110,9 @@ def binary_dilation(binary: np.ndarray, kernel_size: int) -> np.ndarray:
 def apply_morphology(mask: np.ndarray) -> np.ndarray:
     binary = mask.copy()
 
-    for _ in range(Config.MORPH_ITERATIONS):
-        binary = binary_erosion(binary, Config.MORPH_KERNEL_SIZE)
-        binary = binary_dilation(binary, Config.MORPH_KERNEL_SIZE)
-
-    for _ in range(Config.MORPH_ITERATIONS):
-        binary = binary_dilation(binary, Config.MORPH_KERNEL_SIZE)
-        binary = binary_erosion(binary, Config.MORPH_KERNEL_SIZE)
+    # Closing: erosion followed by dilation to remove holes
+    binary = binary_erosion(binary, Config.MORPH_KERNEL_SIZE)
+    binary = binary_dilation(binary, Config.MORPH_KERNEL_SIZE)
 
     return binary
 
@@ -147,6 +138,53 @@ def classify_parking_spots(mask: np.ndarray, rois: list[tuple[int, int, int, int
             "status": "OCCUPIED" if is_occupied else "EMPTY",
         })
 
+    return results
+
+
+def classify_parking_spots_by_darkness(gray_image: np.ndarray, rois: list[tuple[int, int, int, int]]) -> list[dict]:
+    """
+    Detect occupancy by analyzing spot brightness deviation.
+    Both dark cars (shadows) and light cars (white/silver) differ from empty asphalt baseline.
+    """
+    results = []
+    
+    # Calculate baseline brightness - use 65th percentile of all spot intensities
+    all_spot_intensities = []
+    for x1, y1, x2, y2 in rois:
+        roi_region = gray_image[y1:y2, x1:x2]
+        if roi_region.size > 0:
+            all_spot_intensities.extend(roi_region.flatten())
+    
+    if not all_spot_intensities:
+        all_spot_intensities = [128]
+    
+    baseline_brightness = np.percentile(all_spot_intensities, 65)
+    # Occupied if significantly darker OR significantly lighter than baseline
+    dark_threshold = baseline_brightness - 25
+    light_threshold = baseline_brightness + 15
+    
+    for i, (x1, y1, x2, y2) in enumerate(rois):
+        roi_region = gray_image[y1:y2, x1:x2]
+        
+        if roi_region.size == 0:
+            mean_intensity = baseline_brightness
+            darkness_ratio = 0.0
+        else:
+            mean_intensity = roi_region.astype(np.float32).mean()
+            # Ratio measures deviation from baseline (darkness OR brightness)
+            darkness_ratio = max(0.0, abs(baseline_brightness - mean_intensity) / max(1, baseline_brightness))
+        
+        # Occupied if spot is much darker OR much lighter than baseline
+        is_occupied = (mean_intensity < dark_threshold) or (mean_intensity > light_threshold)
+        
+        results.append({
+            "roi_id": i,
+            "bbox": (x1, y1, x2, y2),
+            "changed_ratio": darkness_ratio,
+            "is_occupied": is_occupied,
+            "status": "OCCUPIED" if is_occupied else "EMPTY",
+        })
+    
     return results
 
 
@@ -202,15 +240,9 @@ def visualize_results(image_path: str, results: list[dict], output_path: str = "
 def detect_occupancy(current_image_path: str,
                      reference_image_path: str,
                      rois: list[tuple[int, int, int, int]]) -> list[dict]:
+    """Detect occupancy using darkness analysis (reference_image_path ignored)."""
     current_gray = preprocess_image(current_image_path)
-    reference_gray = preprocess_image(reference_image_path)
-
-    if current_gray.shape != reference_gray.shape:
-        raise ValueError("Current image and reference image must have the same size.")
-
-    mask = compute_foreground_mask(current_gray, reference_gray)
-    mask = apply_morphology(mask)
-    results = classify_parking_spots(mask, rois)
+    results = classify_parking_spots_by_darkness(current_gray, rois)
     return results
 
 
